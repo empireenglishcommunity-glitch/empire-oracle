@@ -63,3 +63,5 @@ db/custom.db
 
 # Local dev process id
 .zscripts/dev.pid
+# Local test databases (any name, not just custom.db)
+db/*.db
