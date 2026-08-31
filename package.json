@@ -13,7 +13,9 @@
     "db:reset": "prisma migrate reset",
     "generate:audio": "npx tsx scripts/generate-listening-audio.ts",
     "generate:audio:all": "npx tsx scripts/generate-listening-audio.ts --regenerate",
-    "migrate:force-reset-passwords": "npx tsx scripts/force-reset-all-passwords.ts"
+    "migrate:force-reset-passwords": "npx tsx scripts/force-reset-all-passwords.ts",
+    "check:cefr": "npx tsx scripts/check-cefr-mapping.mjs",
+    "render:cards": "npx tsx scripts/render-rank-cards.mjs"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

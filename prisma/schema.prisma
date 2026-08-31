@@ -111,6 +111,18 @@ model Assessment {
   flagged       Boolean  @default(false)
   flagReason    String?
 
+  // ─── Public share (rank cards) ───────────────────────────
+  //
+  // Sharing is OPT-IN and REVOCABLE. Both fields are null until the owner of the
+  // assessment asks for a card.
+  //
+  // `shareSlug` is a random token, deliberately NOT the assessment id: the id
+  // appears in authenticated URLs, so making it the public handle would let anyone
+  // holding a link to their own result probe toward someone else's. Clearing the
+  // slug revokes the card (the route 404s) without touching the result itself.
+  shareSlug     String?  @unique
+  sharedAt      DateTime?
+
   user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
   recordings Recording[]
   answers   Answer[]
