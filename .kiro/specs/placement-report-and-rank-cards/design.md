@@ -1,7 +1,24 @@
 # Paid Placement Report & Shareable Rank Cards — Design
 
-> **Status (2026-08-31): DESIGN — nothing built.** Companion to `requirements.md`
-> (read that first). Phases are in §7.
+> **Status (2026-08-31): PHASES 1 AND 2 BUILT — rank cards work. Phases 3–5
+> pending.** Companion to `requirements.md` (read that first). Phases are in §7.
+>
+> **Evidence:** `npm run check:cefr` passes and is mutation-tested (placing at a
+> band's ceiling instead of its floor fails it; guessing a level for an unknown band
+> fails it; changing a level's weeks fails the 90-week total).
+> `npm run render:cards` renders **13 cards** — all four ranks plus eleven edge
+> cases — and asserts **5 refusals** (in-progress, not-started, flagged, missing
+> band, bogus band). The PNGs were **looked at**, which is how two polish issues
+> were caught: the long-name case needed truncation, and `CEFR A1 · STARTS AT A1`
+> was repeating itself on single-level bands.
+>
+> `tsc` reports **0 errors in the new files**; the repo's 34 pre-existing errors
+> across 12 files are unchanged (verified by stashing).
+>
+> **Not yet done:** the `shareSlug` field exists in `schema.prisma` but
+> **`npm run db:push` has not been run against any live database**, so the columns
+> do not exist in production yet. Nothing is deployed. Satori renders no Arabic
+> (§4.1) — deliberate, and the card is Latin-only as a result.
 
 ---
 
@@ -56,9 +73,22 @@ copy — import the shape, re-verify against the bot.**
 
 ## 3. Report
 
+### 3.0 Two corrections to this document, found while implementing
+
+Both were wrong when written and are recorded rather than silently edited:
+
+1. **This app is NOT locale-routed.** Routes are flat (`/results`, `/dashboard`,
+   `/admin`). There is no `[locale]` segment, so the routes below are
+   `/report/[assessmentId]` and `/rank/[shareSlug]`, not `/[locale]/…`.
+2. **The database is SQLite, not Supabase/PostgreSQL.** `prisma/schema.prisma`
+   declares `provider = "sqlite"`. The repo's own steering said
+   Supabase/PostgreSQL — that claim is stale. There is also no `migrations/`
+   directory: this repo is schema-first via `npm run db:push`, so the `shareSlug`
+   field ships as a schema change plus a push, **not** as a migration file.
+
 ### 3.1 Route and shape
 
-- `/[locale]/report/[assessmentId]` — server-rendered, gated: the owner of the
+- `/report/[assessmentId]` — server-rendered, gated: the owner of the
   assessment, or a valid paid entitlement.
 - Sections, in order:
   1. **Headline** — rank + CEFR band + total /120 + placement level.
@@ -110,8 +140,10 @@ nothing.
 ### 4.2 Route and integrity
 
 ```
-GET /api/card/[assessmentId]        → PNG, 1200×630
-GET /[locale]/rank/[shareSlug]      → landing page whose OG image is the PNG
+GET    /api/card/[assessmentId]   → PNG, 1200×630 (accepts an id or a share slug)
+GET    /rank/[shareSlug]          → landing page whose OG image is the PNG
+POST   /api/card/share            → opt in, returns { shareSlug, url }
+DELETE /api/card/share            → revoke
 ```
 
 - **Every value is read from the database inside the handler.** No score, rank or
@@ -172,21 +204,21 @@ Each phase is independently shippable. Cards come first: they are free, they nee
 no payment rail, and they start compounding while the report is built.
 
 ### Phase 1 — Reconciliation (no user-visible change)
-- [ ] 1.1 `src/lib/cefr-mapping.ts` — the single band→level mapping. `Req: R4.2`
-- [ ] 1.2 Mirror the bot's six-level CEFR data, matching `empire-agora`'s module.
+- [x] 1.1 `src/lib/cefr-mapping.ts` — the single band→level mapping. `Req: R4.2`
+- [x] 1.2 Mirror the bot's six-level CEFR data, matching `empire-agora`'s module.
       Re-verify against `config.py`, do not hand-copy. `Req: R4.1`
-- [ ] 1.3 A unit test asserting every `cefrLevel` band the schema comment lists maps
+- [x] 1.3 A unit test asserting every `cefrLevel` band the schema comment lists maps
       to exactly one level. `Req: R4.2`
 
 ### Phase 2 — Rank cards (free, the viral loop)
-- [ ] 2.1 `shareSlug` on `Assessment` — nullable, random, unique, opt-in. `Req: R5.4, R5.7`
-- [ ] 2.2 `GET /api/card/[assessmentId]` via `ImageResponse`, **all values read
+- [x] 2.1 `shareSlug` on `Assessment` — nullable, random, unique, opt-in. `Req: R5.4, R5.7`
+- [x] 2.2 `GET /api/card/[assessmentId]` via `ImageResponse`, **all values read
       server-side**. `Req: R5.1, R5.2`
-- [ ] 2.3 Refuse non-completed and `flagged` assessments. `Req: R3.5`
-- [ ] 2.4 `/[locale]/rank/[shareSlug]` landing page with OG + Twitter meta. `Req: R5.5`
-- [ ] 2.5 Opt-in share control, with revoke. `Req: R5.7`
-- [ ] 2.6 Rate limiting on both routes. `Req: §5`
-- [ ] 2.7 **Render every rank and every edge case and look at the PNGs.** Verify the
+- [x] 2.3 Refuse non-completed and `flagged` assessments. `Req: R3.5`
+- [x] 2.4 `/[locale]/rank/[shareSlug]` landing page with OG + Twitter meta. `Req: R5.5`
+- [x] 2.5 Opt-in share control, with revoke. `Req: R5.7`
+- [x] 2.6 Rate limiting on both routes. `Req: §5`
+- [x] 2.7 **Render every rank and every edge case and look at the PNGs.** Verify the
       Arabic glyph by glyph or remove it. Verify unfurl in WhatsApp. `Req: R5.8`
 
 ### Phase 3 — The report (paid)
