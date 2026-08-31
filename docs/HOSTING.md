@@ -80,10 +80,48 @@ correctness defects in
 (P0) are fixed — migrating a system that is scoring incorrectly just relocates
 the bug and adds a second suspect when results look wrong.
 
-## Why the stale `netlify.toml` was worth deleting
+## 🔴 A live duplicate of the assessment IS on Netlify (found 2026-08-31)
 
-It was not merely untidy. It declared `publish = ".next"` and the
-`@netlify/plugin-nextjs` plugin, so **if anyone had ever connected this repo to
-Netlify, it would have built and served a second live copy of the assessment** —
-against a different (empty) database, on a different URL, with its own
-certificates and student records. Removing it closes that path.
+This is not hypothetical and it is not merely stale config. **A Netlify project
+named `eecassessment` is connected to this repository and is serving a
+fully-functional public copy of the assessment right now:**
+
+```
+https://eecassessment.netlify.app/          → HTTP 200, server: Netlify
+https://eecassessment.netlify.app/assessment/writing → HTTP 200  (the test is takeable)
+https://eecassessment.netlify.app/api/questions      → HTTP 400 {"error":"Module parameter required"}
+```
+
+That last response matters: a 400 from the application means the **API routes are
+executing**, not 404-ing as static files. It is a running app, not a broken
+build. It also builds a **deploy preview on every pull request** — the check
+`netlify/eecassessment/deploy-preview` appeared on PR #24 with a public URL
+(`deploy-preview-24--eecassessment.netlify.app`).
+
+**Why this matters**
+
+- It is a **fourth assessment surface**, after `assessment.empireenglish.online`,
+  `test.empireenglish.online` and the dojo `/placement/` page.
+- Its database is **not** production's. Any student who registers or completes a
+  test there creates records the admin panel cannot see — the work is silently
+  lost, exactly like the guest-mode defect in the P0 audit.
+- Every PR publishes another public copy at a predictable URL.
+- It serves the same defective scoring (writing constant 18/30), under an
+  Empire-English-branded page, at a URL nobody is monitoring.
+
+**Deleting `netlify.toml` does NOT switch this off.** Netlify builds from its own
+project settings, not from the presence of that file — removing it may simply
+change *how* it builds. Shutting it down is **owner-gated** and must be done in
+the Netlify dashboard:
+
+1. Netlify → project `eecassessment` → **Site configuration → Danger zone** →
+   either **unlink the GitHub repository** (stops all future builds and previews)
+   or **delete the site** (also removes `eecassessment.netlify.app`).
+2. Confirm the check `netlify/eecassessment/deploy-preview` no longer appears on
+   a new PR.
+3. If the site is kept for any reason, at minimum set password protection and
+   add `X-Robots-Tag: noindex` so it cannot be found or indexed.
+
+Removing `netlify.toml` is still correct — it stops the repo *declaring* a
+Netlify build — but it closes only half the path. The other half is the Netlify
+project itself.
