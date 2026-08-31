@@ -65,7 +65,16 @@ export default function ListeningAssessmentPage() {
             questionId: a.questionId,
             selectedAnswer: a.selectedAnswer,
             isCorrect: a.isCorrect,
-            timeTaken: 5000,
+            // 0 → the server records no timing for this answer.
+            //
+            // This was hardcoded to 5000, meaning every listening answer
+            // reported exactly 5.0 seconds. That is not "no data", it is
+            // fabricated data, and it was fed straight into the response-time
+            // integrity analysis — which then drew conclusions from a constant.
+            // A check that is quietly reasoning about fiction is worse than one
+            // that is switched off, so until this page measures real elapsed
+            // time per question, it reports none.
+            timeTaken: 0,
           })),
           scores: {
             overall: calculatedScore,

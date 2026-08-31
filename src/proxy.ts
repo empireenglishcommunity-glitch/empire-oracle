@@ -5,6 +5,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
+import { getToken } from 'next-auth/jwt';
 
 // ─── Route Protection Configuration ────────────────────────────
 
@@ -67,8 +68,12 @@ if (typeof setInterval !== 'undefined') {
   }, 5 * 60_000);
 }
 
-export function proxy(request: NextRequest) {
-  const { pathname } = request.nextUrl;
+function isProtected(pathname: string): boolean {
+  return PROTECTED_ROUTES.some((r) => pathname === r || pathname.startsWith(`${r}/`));
+}
+
+export async function proxy(request: NextRequest) {
+  const { pathname, search } = request.nextUrl;
 
   // ─── Skip Static Assets & Internal Routes ──────────────────
   if (
@@ -103,6 +108,28 @@ export function proxy(request: NextRequest) {
         headers: { 'Content-Type': 'text/html', 'Retry-After': '30' },
       }
     );
+  }
+
+  // ─── Auth Gate for Protected Routes ────────────────────────
+  //
+  // PROTECTED_ROUTES was declared at the top of this file and then never
+  // referenced — the gate was intended and never wired up. The practical effect:
+  // only the assessment HUB checked auth, and it did so client-side, so
+  // /assessment/reading, /writing, /listening, /speaking, /vocabulary and
+  // /grammar each rendered a complete test to a logged-out visitor and showed
+  // them a score. That score was then silently discarded, because every submit
+  // path needs a session to persist anything.
+  //
+  // Showing someone a score we are throwing away is worse than asking them to
+  // sign in first, so the declared intent is now enforced.
+  if (isProtected(pathname)) {
+    const token = await getToken({ req: request, secret: process.env.NEXTAUTH_SECRET });
+    if (!token) {
+      const login = new URL('/login', request.url);
+      // Preserve the destination so login can return them to it.
+      login.searchParams.set('next', `${pathname}${search}`);
+      return NextResponse.redirect(login);
+    }
   }
 
   // ─── Security Headers ──────────────────────────────────────

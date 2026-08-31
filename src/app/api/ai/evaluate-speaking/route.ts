@@ -14,14 +14,33 @@ async function handler(req: NextRequest) {
   try {
     const { transcript, expectedText, part, taskType, context, duration } = await req.json();
 
-    // No transcript = no score (honest evaluation)
+    const isWriting = taskType === 'writing_summary' || taskType === 'writing_essay';
+
+    // Every response from this route is shaped { evaluation, source }.
+    //
+    // It used to be inconsistent: the two writing branches spread their scores
+    // FLAT while every guard and both speaking branches nested them under
+    // `evaluation`. The writing UI read the flat shape, so any guard response
+    // gave it `undefined` for every criterion — which its `?? 15` defaults then
+    // turned into a mid-band score. Combined with the caller sending
+    // `transcription` instead of `transcript`, every writing submission scored a
+    // constant 18/30. Keep this ONE shape.
+    //
+    // The two tasks also use different field names AND different scales:
+    //   writing  → { overall, grammar, coherence, vocabulary, development }  0-25
+    //   speaking → { overallScore, pronunciation, fluency, ... }             0-100
+    // so a guard must answer in the shape of the task it was asked about.
+    const emptyEvaluation = (feedback: string) => (isWriting
+      ? { overall: 0, grammar: 0, coherence: 0, vocabulary: 0, development: 0, feedback }
+      : {
+        overallScore: 0, pronunciation: 0, fluency: 0,
+        grammar: 0, vocabulary: 0, coherence: 0, similarity: 0, feedback,
+      });
+
+    // No submission = no score (honest evaluation)
     if (!transcript || transcript.trim().length === 0) {
       return NextResponse.json({
-        evaluation: {
-          overallScore: 0, pronunciation: 0, fluency: 0,
-          grammar: 0, vocabulary: 0, coherence: 0, similarity: 0,
-          feedback: 'No speech detected.',
-        },
+        evaluation: emptyEvaluation(isWriting ? 'No text submitted.' : 'No speech detected.'),
         source: 'none',
       });
     }
@@ -32,11 +51,16 @@ async function handler(req: NextRequest) {
     // Too few words
     if (wordCount < 3) {
       return NextResponse.json({
-        evaluation: {
-          overallScore: 5, pronunciation: 5, fluency: 5,
-          grammar: 5, vocabulary: 5, coherence: 5, similarity: 0,
-          feedback: 'Too few words spoken to evaluate properly.',
-        },
+        evaluation: isWriting
+          ? {
+            overall: 0, grammar: 0, coherence: 0, vocabulary: 0, development: 0,
+            feedback: 'Too short to evaluate — write at least a few sentences.',
+          }
+          : {
+            overallScore: 5, pronunciation: 5, fluency: 5,
+            grammar: 5, vocabulary: 5, coherence: 5, similarity: 0,
+            feedback: 'Too few words spoken to evaluate properly.',
+          },
         source: 'minimum',
       });
     }
@@ -55,15 +79,18 @@ async function handler(req: NextRequest) {
           const clean = aiResult.content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
           const evaluation = JSON.parse(clean);
           if (typeof evaluation.overall === 'number') {
-            return NextResponse.json({ ...evaluation, source: aiResult.source });
+            // Nested, like every other branch. Was spread flat.
+            return NextResponse.json({ evaluation, source: aiResult.source });
           }
         } catch { /* fall through to deterministic */ }
       }
 
-      // Deterministic writing fallback
+      // Deterministic writing fallback. Returns 0-25 per criterion (it scales
+      // internally), matching the 0-25 the AI prompt above asks for and the
+      // /25 the writing page divides by. Do not "normalise" it to 0-100.
       const { scoreWritingDeterministic } = await import('@/lib/ai-provider');
       const detScore = scoreWritingDeterministic(cleanTranscript, taskType === 'writing_summary' ? 175 : 300);
-      return NextResponse.json({ ...detScore, source: 'deterministic' });
+      return NextResponse.json({ evaluation: detScore, source: 'deterministic' });
     }
 
     // ─── Speaking evaluation ────────────────────────────────

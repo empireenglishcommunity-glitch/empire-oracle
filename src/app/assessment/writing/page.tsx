@@ -230,20 +230,34 @@ async function evaluateWriting(text: string, type: 'summary' | 'essay', sourcePa
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        transcription: text,
+        // Field name is `transcript` — the route destructures exactly that.
+        // Sending `transcription` made the route see an empty submission and
+        // return zeros, which the old `?? 15` defaults below silently turned
+        // into a mid-band score. Every essay scored 18/30 as a result.
+        transcript: text,
         taskType: type === 'summary' ? 'writing_summary' : 'writing_essay',
         context: sourcePassage,
       }),
     });
     if (!res.ok) throw new Error('AI evaluation failed');
     const data = await res.json();
+
+    // Scores are nested under `evaluation` (0-25 per criterion), and are
+    // validated before use — the same way the speaking page does it. There are
+    // deliberately NO `?? 15` fallbacks: a missing score must fall through to
+    // the local deterministic scorer, which actually reads the text, rather
+    // than quietly becoming an average mark.
+    const ev = data?.evaluation;
+    if (!ev || typeof ev.overall !== 'number') {
+      return fallbackScore(text, type === 'summary' ? 150 : 300);
+    }
     return {
-      grammar: data.grammar ?? data.pronunciation ?? 15,
-      coherence: data.coherence ?? data.fluency ?? 15,
-      vocabulary: data.vocabulary ?? 15,
-      development: data.development ?? data.content ?? 15,
-      overall: data.overall ?? data.score ?? 15,
-      feedback: data.feedback ?? 'Evaluation complete.',
+      grammar: ev.grammar,
+      coherence: ev.coherence,
+      vocabulary: ev.vocabulary,
+      development: ev.development,
+      overall: ev.overall,
+      feedback: ev.feedback ?? 'Evaluation complete.',
     };
   } catch {
     return fallbackScore(text, type === 'summary' ? 150 : 300);

@@ -11,6 +11,35 @@ interface AnswerInput {
   timeTaken: number; // milliseconds
 }
 
+// The four section scores (reading / listening / speaking / writing) are all
+// 0-30, and the total is their sum out of 120.
+const SECTION_MAX = 30;
+
+/** Convert a 0-100 rating to the 0-30 section scale. */
+function toSectionScore(raw: unknown): number | null {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return null;
+  return Math.round(Math.max(0, Math.min(100, raw)) / 100 * SECTION_MAX);
+}
+
+/**
+ * Accept a value that is ALREADY on the 0-30 section scale.
+ *
+ * Returns null for anything outside the range rather than clamping it. Clamping
+ * is what hid the speaking scale bug: a 0-100 value arrived, `Math.min(30, …)`
+ * silently turned any score above 30 into a perfect section score, and nothing
+ * reported it. A caller sending the wrong scale is a bug we want to see.
+ */
+function asSectionScore(raw: unknown, module: string, field: string): number | null {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return null;
+  if (raw < 0 || raw > SECTION_MAX) {
+    console.error(
+      `[SUBMIT] ${module}.${field} = ${raw} is outside the 0-${SECTION_MAX} section scale — rejected, not clamped.`,
+    );
+    return null;
+  }
+  return Math.round(raw);
+}
+
 async function handler(req: NextRequest) {
   try {
     const { assessmentId, module, answers, scores, userId: clientUserId } = await req.json();
@@ -65,14 +94,11 @@ async function handler(req: NextRequest) {
         if (user) userId = user.id;
       }
 
-      // Method 4: If single user (testing), use them
-      if (!userId) {
-        const count = await db.user.count().catch(() => 0);
-        if (count === 1) {
-          const user = await db.user.findFirst();
-          if (user) userId = user.id;
-        }
-      }
+      // NOTE: there was a "Method 4: if there is exactly one user in the DB,
+      // attribute the submission to them". It was a testing shortcut that
+      // shipped, and it silently wrote one person's answers onto another
+      // account's record (e.g. a logged-out guest on a fresh database). A
+      // submission we cannot attribute must be rejected, not guessed at.
 
       console.log('[SUBMIT] userId resolved:', userId ? userId.slice(0, 8) + '...' : 'NULL', 'module:', module);
 
@@ -129,9 +155,14 @@ async function handler(req: NextRequest) {
             updateData.spVocabRange = scores.vocabularyRange ?? null;
             updateData.spConfidence = scores.confidence ?? null;
             updateData.spRhythmMatch = scores.rhythmMatch ?? null;
-            updateData.spOverall = scores.overall ?? null;
             updateData.spLevel = scores.level ?? null;
-            updateData.speakingScore = scores.overall ?? null;
+            // Speaking is rated on 0-100 (see SPEAKING_LEVELS), but
+            // `speakingScore` is a 0-30 SECTION score like the other three.
+            // Both columns used to receive the raw 0-100 value, and the results
+            // page then did Math.min(30, …) — so every speaking score of 30 or
+            // more was reported as a perfect 30/30. Keep the scales distinct.
+            updateData.spOverall = scores.overall ?? null;              // 0-100
+            updateData.speakingScore = toSectionScore(scores.overall);  // 0-30
           }
 
           if (module === 'listening' && scores) {
@@ -139,15 +170,15 @@ async function handler(req: NextRequest) {
             updateData.liInference = scores.inference ?? null;
             updateData.liOverall = scores.overall ?? null;
             updateData.liLevel = scores.level ?? null;
-            updateData.listeningScore = scores.overall ?? null;
+            updateData.listeningScore = asSectionScore(scores.overall, module, 'overall');
           }
 
           if (module === 'reading' && scores) {
-            updateData.readingScore = scores.overall ?? null;
+            updateData.readingScore = asSectionScore(scores.overall, module, 'overall');
           }
 
           if (module === 'writing' && scores) {
-            updateData.writingScore = scores.overall ?? null;
+            updateData.writingScore = asSectionScore(scores.overall, module, 'overall');
           }
 
           // Check if all modules are complete
@@ -163,6 +194,30 @@ async function handler(req: NextRequest) {
             updateData.status = 'completed';
             updateData.completedAt = new Date();
           }
+
+          // ─── Persist the total and the level (server-side) ──────
+          //
+          // `totalScore` and `cefrLevel` are columns that nothing ever wrote.
+          // Every surface recomputed them client-side on render, so the admin
+          // table, the score email and the certificate all read NULL and fell
+          // back to defaults ('A1'). The server owns this now: it is the only
+          // place that sees all four section scores.
+          //
+          // The MAPPING itself is still the legacy one (4 buckets with compound
+          // bands like 'A2-B1'). Replacing it with six discrete CEFR levels is
+          // P1 — see docs/CEFR-ALIGNMENT-AUDIT-AND-PLAN-2026-08-31.md. This
+          // change only makes the stored value real.
+          const { getTotalLevel } = await import('@/lib/types');
+          const sectionOf = (key: string): number => {
+            const pending = updateData[key];
+            if (typeof pending === 'number') return pending;
+            const stored = (currentAssessment as Record<string, unknown> | null)?.[key];
+            return typeof stored === 'number' ? stored : 0;
+          };
+          const total = sectionOf('readingScore') + sectionOf('listeningScore')
+            + sectionOf('speakingScore') + sectionOf('writingScore');
+          updateData.totalScore = total;
+          updateData.cefrLevel = getTotalLevel(total).cefr;
 
           await db.assessment.update({
             where: { id: assessment.id },
@@ -185,7 +240,14 @@ async function handler(req: NextRequest) {
         }
       }
     } catch (dbError) {
-      console.log('DB save failed, continuing:', dbError);
+      // This used to log and fall through to `success: true`. A student's
+      // results silently vanishing looked identical to a successful save, both
+      // to them and to us. Persistence failing IS the request failing.
+      console.error('[SUBMIT] DB save failed:', dbError);
+      return NextResponse.json(
+        { error: 'Could not save your results. Please try again.' },
+        { status: 500 },
+      );
     }
 
     return NextResponse.json({
