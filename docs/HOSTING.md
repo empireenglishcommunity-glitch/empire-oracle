@@ -87,3 +87,46 @@ It was not merely untidy. It declared `publish = ".next"` and the
 Netlify, it would have built and served a second live copy of the assessment** —
 against a different (empty) database, on a different URL, with its own
 certificates and student records. Removing it closes that path.
+
+## ⚠️ A live Netlify duplicate EXISTS and is NOT hypothetical — owner action required
+
+**Verified live 2026-09-17.** The "if anyone had ever connected this repo to
+Netlify" above is not hypothetical: a Netlify project **`eecassessment`** IS
+connected to this repo and is serving a full, public copy of the assessment at
+**`https://eecassessment.netlify.app`** (`/` → 200, `/login` → 200,
+`/assessment/reading` → 307). It also publishes a **deploy preview per PR**.
+
+Two reasons this must be shut down, not just noted:
+
+1. **Split student data.** Its database is a separate, non-production one. Anyone
+   who registers or takes the test there is **invisible to the admin panel** and
+   their results are silently discarded — a student could believe they were
+   placed when nothing was recorded.
+2. **It runs OLD, vulnerable code.** Confirmed 2026-09-17: the Netlify copy still
+   **leaks `correctAnswer`** and still trusts a client-supplied `correct` — i.e.
+   the score-forgery hole fixed on the production box (server-side grading,
+   PR #27) is **still open on the Netlify duplicate**, because Netlify builds
+   from its own project settings and never saw that deploy.
+
+**Deleting `netlify.toml` did NOT stop it** (and cannot): Netlify builds from the
+project's own settings, not from a file in the repo.
+
+### Shutdown — must be done from the owner's Netlify dashboard (not doable from CI/SSH)
+
+1. Log in to Netlify → **Sites** → open the **`eecassessment`** site.
+2. Either **disconnect the repository** (Site configuration → Build & deploy →
+   Continuous deployment → **Unlink/Manage repository**) to stop all future
+   builds and PR previews, **or** delete the site entirely (Site configuration →
+   **Danger zone → Delete this site**). Deleting is the cleaner choice — nothing
+   in the Empire English architecture depends on it (see the architecture diagram
+   above; the only public entry point is the Cloudflare Tunnel to the Hetzner box).
+3. If the custom sub-project was only reachable via `*.netlify.app`, deletion also
+   frees the `eecassessment` subdomain. There is no Cloudflare DNS record to
+   remove (the duplicate lives entirely on Netlify's domain).
+4. **Verify afterwards:** `curl -s -o /dev/null -w "%{http_code}"
+   https://eecassessment.netlify.app/` should return a Netlify 404/unavailable
+   page, not 200.
+
+Until this is done, the fixed production app at `assessment.empireenglish.online`
+is correct, but the Netlify copy remains a live, forgeable, data-splitting
+duplicate.
