@@ -51,8 +51,13 @@ export default function ReadingAssessmentPage() {
   const [adaptiveItem, setAdaptiveItem] = useState<{
     id: string;
     passage: { title: string; text: string; difficulty: string; topic: string; wordCount: number };
-    question: { id: string; type: string; questionText: string; options: string[]; correctAnswer: number };
+    // Options arrive ALREADY SHUFFLED by the server and carry NO answer key —
+    // grading is server-side now (security fix for the client-controlled score).
+    question: { id: string; type: string; questionText: string; options: string[] };
   } | null>(null);
+  // The server's verdict on the current item, returned by /answer AFTER we post
+  // our selected index. Drives the correct/wrong reveal; null until answered.
+  const [adaptiveReveal, setAdaptiveReveal] = useState<{ correct: boolean; correctIndex: number } | null>(null);
   const [adaptiveProgress, setAdaptiveProgress] = useState({ questionsAnswered: 0, maxQuestions: 15, confidence: 0 });
   const [adaptiveResults, setAdaptiveResults] = useState<{ score: number; questionsAnswered: number; totalCorrect: number; accuracy: number } | null>(null);
 
@@ -120,12 +125,14 @@ export default function ReadingAssessmentPage() {
     return shuffleOptions(cq.options, cq.correctAnswer, seed);
   }, [passages, currentPassageIndex, currentQuestionIndex]);
 
-  // Shuffle for adaptive mode
-  const adaptiveShuffled = useMemo(() => {
-    if (!adaptiveItem?.question) return { shuffledOptions: [] as string[], newCorrectIndex: 0 };
-    const seed = adaptiveItem.question.id.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0);
-    return shuffleOptions(adaptiveItem.question.options, adaptiveItem.question.correctAnswer, seed);
-  }, [adaptiveItem]);
+  // Adaptive options are pre-shuffled by the server and sent without an answer
+  // key, so the client no longer shuffles or knows the correct index up front.
+  // Grading happens on the server; the reveal uses `adaptiveReveal` returned by
+  // /answer. This object keeps the render code below unchanged in shape.
+  const adaptiveShuffled = useMemo(() => ({
+    shuffledOptions: adaptiveItem?.question?.options ?? [],
+    newCorrectIndex: adaptiveReveal?.correctIndex ?? -1,
+  }), [adaptiveItem, adaptiveReveal]);
 
   // ─── Adaptive: Start IRT Test ────────────────────────────
 
@@ -157,7 +164,16 @@ export default function ReadingAssessmentPage() {
 
   // ─── Adaptive: Submit Answer ─────────────────────────────
 
-  const handleAdaptiveAnswer = useCallback(async (correct: boolean) => {
+  // Buffer for the next item, which the server returns in the SAME /answer
+  // response that grades the current one — so there is exactly ONE post per
+  // item. "Next Question" just swaps this in; it does not post again.
+  const pendingNextRef = useRef<{ currentItem: typeof adaptiveItem; progress: typeof adaptiveProgress } | 'complete' | null>(null);
+  const pendingResultsRef = useRef<{ score: number; questionsAnswered: number; totalCorrect: number; accuracy: number } | null>(null);
+
+  // Posts the SELECTED INDEX (in the server-shuffled order) ONCE and lets the
+  // server grade. Shows the server's verdict (reveal); the next item is
+  // buffered and swapped in by handleAdaptiveNext without another post.
+  const handleAdaptiveAnswer = useCallback(async (selectedIndex: number) => {
     if (!adaptiveSessionId || !adaptiveItem) return;
 
     try {
@@ -168,46 +184,42 @@ export default function ReadingAssessmentPage() {
           action: 'answer',
           userId: 'current',
           sessionId: adaptiveSessionId,
-          response: { itemId: adaptiveItem.id, correct },
+          response: { itemId: adaptiveItem.id, selectedIndex },
         }),
       });
       if (!res.ok) throw new Error('Failed to submit answer');
       const data = await res.json();
 
+      // Record the server's verdict (drives the reveal + the running answer log).
+      const isCorrect = !!data.lastResult?.correct;
+      if (data.lastResult) {
+        setAdaptiveReveal({ correct: isCorrect, correctIndex: data.lastResult.correctIndex });
+      }
+      setAnswers(prev => [...prev, { questionId: adaptiveItem.question.id, selectedAnswer: selectedIndex, isCorrect }]);
+
       if (data.isComplete) {
-        // Test is done — show results
-        setAdaptiveResults(data.results);
-        setScore(data.results.score);
-        setPhase('results');
-        if (timerRef.current) clearInterval(timerRef.current);
-        // Submit score to dashboard
-        submitReadingScore(data.results.score, answers);
+        pendingNextRef.current = 'complete';
+        // Stash results; the reveal shows first, then handleAdaptiveNext finishes.
+        pendingResultsRef.current = data.results;
       } else {
-        // Load next item
-        setAdaptiveItem(data.currentItem);
-        setAdaptiveProgress(data.progress);
-        setSelectedOption(null);
-        setIsAnswered(false);
-        // Reset timer for new passage
-        if (data.currentItem?.passage?.difficulty) {
-          startPassageTimer(data.currentItem.passage.difficulty as 'easy' | 'medium' | 'hard');
-        }
+        pendingNextRef.current = { currentItem: data.currentItem, progress: data.progress };
       }
     } catch {
-      // On error, just finish with what we have
       setPhase('results');
       submitReadingScore(score || 0, answers);
     }
-  }, [adaptiveSessionId, adaptiveItem, startPassageTimer]);
+  }, [adaptiveSessionId, adaptiveItem, score, answers, submitReadingScore]);
 
   // ─── Adaptive: Skip Question ─────────────────────────────
 
   const handleAdaptiveSkip = useCallback(() => {
     if (isAnswered) return;
-    setAnswers(prev => [...prev, { questionId: adaptiveItem?.question?.id || '', selectedAnswer: -1, isCorrect: false }]);
+    setSelectedOption(-1);
     setIsAnswered(true);
-    handleAdaptiveAnswer(false);
-  }, [isAnswered, adaptiveItem, handleAdaptiveAnswer]);
+    // -1 = "I don't know". The server grades it (incorrect) and returns the
+    // reveal + the next item. The answer log is appended in handleAdaptiveAnswer.
+    handleAdaptiveAnswer(-1);
+  }, [isAnswered, handleAdaptiveAnswer]);
 
   // ─── Adaptive: Select Option ─────────────────────────────
 
@@ -215,16 +227,39 @@ export default function ReadingAssessmentPage() {
     if (isAnswered || !adaptiveItem) return;
     setSelectedOption(idx);
     setIsAnswered(true);
-    const correct = idx === adaptiveShuffled.newCorrectIndex;
-    setAnswers(prev => [...prev, { questionId: adaptiveItem.question.id, selectedAnswer: idx, isCorrect: correct }]);
-  }, [isAnswered, adaptiveItem, adaptiveShuffled]);
+    // Post the selected index; the SERVER decides correctness and sends back
+    // the reveal. The client no longer knows the answer key.
+    handleAdaptiveAnswer(idx);
+  }, [isAnswered, adaptiveItem, handleAdaptiveAnswer]);
 
   // ─── Adaptive: Proceed to Next After Reveal ──────────────
+  // No network call — the next item was already returned by /answer and buffered.
 
   const handleAdaptiveNext = useCallback(() => {
-    const lastAnswer = answers[answers.length - 1];
-    handleAdaptiveAnswer(lastAnswer?.isCorrect || false);
-  }, [answers, handleAdaptiveAnswer]);
+    const pending = pendingNextRef.current;
+    pendingNextRef.current = null;
+    if (pending === 'complete') {
+      const results = pendingResultsRef.current;
+      if (results) {
+        setAdaptiveResults(results);
+        setScore(results.score);
+      }
+      setPhase('results');
+      if (timerRef.current) clearInterval(timerRef.current);
+      submitReadingScore(results?.score ?? score ?? 0, answers);
+      return;
+    }
+    if (pending && pending.currentItem) {
+      setAdaptiveItem(pending.currentItem);
+      setAdaptiveProgress(pending.progress);
+      setSelectedOption(null);
+      setIsAnswered(false);
+      setAdaptiveReveal(null);
+      if (pending.currentItem.passage?.difficulty) {
+        startPassageTimer(pending.currentItem.passage.difficulty as 'easy' | 'medium' | 'hard');
+      }
+    }
+  }, [answers, score, submitReadingScore, startPassageTimer]);
 
   // ─── Start Trial (router) ────────────────────────────────
 

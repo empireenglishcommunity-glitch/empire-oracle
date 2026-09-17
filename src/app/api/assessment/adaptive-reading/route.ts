@@ -26,8 +26,85 @@ import { ALL_READING_PASSAGES, type ReadingPassage, type ReadingQuestion } from 
 const adaptiveSessions = new Map<string, {
   state: AdaptiveReadingState;
   questionMap: Map<string, { passage: ReadingPassage; question: ReadingQuestion }>;
+  // Per-served-item answer key, kept SERVER-SIDE only. Maps an itemId to the
+  // options as they were shuffled for THIS session and the index of the correct
+  // one AFTER shuffling. This is the whole point of the security fix: the client
+  // is never told which option is correct, and it grades nothing — it posts the
+  // index it selected and the server decides. See the `answer` handler.
+  answerKey: Map<string, { shuffledOptions: string[]; correctIndex: number }>;
   createdAt: number;
 }>();
+
+// ─── Server-side option shuffle (grading authority lives here) ──────────────
+//
+// WHY THIS EXISTS
+// The adaptive reading score used to be CLIENT-CONTROLLED: the browser received
+// each question's `correctAnswer`, graded its own answer, and POSTed
+// `{ itemId, correct }`, which the server trusted. Posting `correct: true`
+// repeatedly yielded a perfect 30/30. The fix is to grade on the server, which
+// means the server must (a) never send the answer key to the client and
+// (b) know, for each option position the client sees, whether it is correct.
+//
+// So the server shuffles the options itself, remembers the correct post-shuffle
+// index, and sends only the shuffled option strings. Deterministic per
+// (sessionId, itemId) so a re-render/status call is stable, but unpredictable
+// across sessions (the sessionId carries a timestamp) so the order cannot be
+// precomputed from the public item bank.
+function _hashString(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+function _seededShuffleOptions(
+  options: string[],
+  correctIndex: number,
+  seedStr: string,
+): { shuffledOptions: string[]; correctIndex: number } {
+  if (options.length <= 1) {
+    return { shuffledOptions: [...options], correctIndex };
+  }
+  // Pair each option with a deterministic key derived from the seed + its text,
+  // then sort by that key — a stable, seed-driven permutation.
+  const seed = _hashString(seedStr);
+  const decorated = options.map((opt, i) => ({
+    opt,
+    isCorrect: i === correctIndex,
+    key: _hashString(`${seed}:${i}:${opt}`),
+  }));
+  decorated.sort((a, b) => a.key - b.key);
+  return {
+    shuffledOptions: decorated.map(d => d.opt),
+    correctIndex: decorated.findIndex(d => d.isCorrect),
+  };
+}
+
+// Prepare a question for sending to the client: shuffle its options
+// server-side, record the correct post-shuffle index in the session's answer
+// key, and return a payload with NO answer key. The client renders
+// `options` in the given order and posts back the index it selected.
+function serveQuestion(
+  sessionId: string,
+  answerKey: Map<string, { shuffledOptions: string[]; correctIndex: number }>,
+  question: ReadingQuestion,
+): { id: string; type: string; questionText: string; options: string[] } {
+  const { shuffledOptions, correctIndex } = _seededShuffleOptions(
+    question.options,
+    question.correctAnswer,
+    `${sessionId}:${question.id}`,
+  );
+  answerKey.set(question.id, { shuffledOptions, correctIndex });
+  return {
+    id: question.id,
+    type: question.type,
+    questionText: question.questionText,
+    options: shuffledOptions,
+    // NOTE: no `correctAnswer` — grading is server-side only.
+  };
+}
 
 // Clean old sessions every 10 minutes
 setInterval(() => {
@@ -67,7 +144,11 @@ async function handler(req: NextRequest) {
       action: 'start' | 'answer' | 'status';
       userId: string;
       sessionId?: string;
-      response?: { itemId: string; correct: boolean };
+      // `selectedIndex` is the option the student picked, in the SERVER-shuffled
+      // order the client was sent (-1 or omitted = "I don't know"/skip). A legacy
+      // `correct` field may still arrive from an old client build; it is
+      // deliberately ignored — the server grades from `selectedIndex` only.
+      response?: { itemId: string; selectedIndex?: number; correct?: boolean };
     };
 
     if (!userId) {
@@ -90,7 +171,8 @@ async function handler(req: NextRequest) {
       });
 
       const sid = `adaptive-${userId}-${Date.now()}`;
-      adaptiveSessions.set(sid, { state, questionMap, createdAt: Date.now() });
+      const answerKey = new Map<string, { shuffledOptions: string[]; correctIndex: number }>();
+      adaptiveSessions.set(sid, { state, questionMap, answerKey, createdAt: Date.now() });
 
       // Get first item
       const nextItem = getNextItem(state);
@@ -103,6 +185,8 @@ async function handler(req: NextRequest) {
         return NextResponse.json({ error: 'Item data not found' }, { status: 500 });
       }
 
+      const publicQuestion = serveQuestion(sid, answerKey, itemData.question);
+
       return NextResponse.json({
         sessionId: sid,
         currentItem: {
@@ -114,13 +198,7 @@ async function handler(req: NextRequest) {
             topic: itemData.passage.topic,
             wordCount: itemData.passage.wordCount,
           },
-          question: {
-            id: itemData.question.id,
-            type: itemData.question.type,
-            questionText: itemData.question.questionText,
-            options: itemData.question.options,
-            correctAnswer: itemData.question.correctAnswer,
-          },
+          question: publicQuestion,
         },
         progress: {
           questionsAnswered: 0,
@@ -136,8 +214,8 @@ async function handler(req: NextRequest) {
     // ─── ANSWER: Process response and get next item ─────────
 
     if (action === 'answer') {
-      if (!sessionId || !response) {
-        return NextResponse.json({ error: 'sessionId and response required' }, { status: 400 });
+      if (!sessionId || !response || !response.itemId) {
+        return NextResponse.json({ error: 'sessionId and response.itemId required' }, { status: 400 });
       }
 
       const session = adaptiveSessions.get(sessionId);
@@ -145,10 +223,28 @@ async function handler(req: NextRequest) {
         return NextResponse.json({ error: 'Session expired or not found' }, { status: 404 });
       }
 
+      // ─── SERVER-SIDE GRADING (do NOT trust a client `correct`) ──────────
+      //
+      // The client posts the INDEX it selected (or -1 / omitted for "I don't
+      // know"). The server looks up the answer key it stored when it served
+      // this item and decides correctness itself. A forged `correct: true` in
+      // the body is ignored — there is no path here that reads it.
+      const key = session.answerKey.get(response.itemId);
+      if (!key) {
+        // Item was never served in this session → cannot be graded. Refuse
+        // rather than guess, so a replayed/forged itemId can't score.
+        return NextResponse.json({ error: 'Item not served in this session' }, { status: 400 });
+      }
+      const selectedIndex = Number.isInteger(response.selectedIndex) ? response.selectedIndex! : -1;
+      const graded = selectedIndex === key.correctIndex;
+      // One grade per served item: drop the key so the same item can't be
+      // re-submitted to nudge the estimate.
+      session.answerKey.delete(response.itemId);
+
       // Process the response
       const irtResponse: IRTResponse = {
         itemId: response.itemId,
-        correct: response.correct,
+        correct: graded,
       };
 
       const newState = processResponse(session.state, irtResponse);
@@ -165,6 +261,9 @@ async function handler(req: NextRequest) {
 
         return NextResponse.json({
           isComplete: true,
+          // The server's verdict on the just-submitted item, so the client can
+          // show its reveal without ever having (or needing) the answer key.
+          lastResult: { itemId: response.itemId, correct: graded, correctIndex: key.correctIndex },
           results: {
             score, // 0-30
             level,
@@ -190,6 +289,7 @@ async function handler(req: NextRequest) {
 
         return NextResponse.json({
           isComplete: true,
+          lastResult: { itemId: response.itemId, correct: graded, correctIndex: key.correctIndex },
           results: {
             score,
             level,
@@ -209,8 +309,12 @@ async function handler(req: NextRequest) {
         return NextResponse.json({ error: 'Next item data not found' }, { status: 500 });
       }
 
+      const publicNextQuestion = serveQuestion(sessionId, session.answerKey, itemData.question);
+
       return NextResponse.json({
         sessionId,
+        // Server's verdict on the item just answered (for the reveal UX).
+        lastResult: { itemId: response.itemId, correct: graded, correctIndex: key.correctIndex },
         currentItem: {
           id: nextItem.id,
           passage: {
@@ -220,13 +324,7 @@ async function handler(req: NextRequest) {
             topic: itemData.passage.topic,
             wordCount: itemData.passage.wordCount,
           },
-          question: {
-            id: itemData.question.id,
-            type: itemData.question.type,
-            questionText: itemData.question.questionText,
-            options: itemData.question.options,
-            correctAnswer: itemData.question.correctAnswer,
-          },
+          question: publicNextQuestion,
         },
         progress: {
           questionsAnswered: newState.responses.length,
